@@ -7308,6 +7308,33 @@ static void test_dspark_verify_depth(void) {
 }
 #endif
 
+/* Verify the IQ4_NL n-gram row decoder against a real row from a
+ * Qwen3.8-Flash-Next GGUF, with reference values from llama.cpp gguf-py. */
+bool qwen4_iq4nl_decode_row(const uint8_t *raw, uint32_t width, float *out);
+
+static void test_iq4nl_ngram_decode(void) {
+    static const uint8_t row0[90] = {
+        0x51,0x8c,0x6b,0x84,0x6d,0x84,0x9a,0xb6,0x6a,0xe6,0x37,0x57,0x41,0x0d,0xba,0xf3,0x12,0x07,
+        0x73,0x0c,0x43,0x86,0x6d,0x87,0x5e,0xb6,0x06,0x66,0xbc,0xc9,0xcb,0x0d,0x48,0x96,0x1e,0x56,
+        0x51,0x0c,0xfa,0x8e,0xcf,0x54,0x09,0xce,0x78,0x9c,0xac,0x39,0x11,0xcc,0x5a,0x54,0x26,0x70,
+        0x5e,0x8d,0x5a,0xbf,0x60,0x4a,0x56,0x5e,0xca,0xa4,0xa5,0x65,0xb9,0xbc,0x79,0x8b,0x9a,0x86,
+        0x0d,0x8c,0x8e,0x79,0xc7,0x83,0x4e,0x13,0x4b,0x61,0x14,0x3c,0x03,0x68,0xd8,0x9d,0xef,0x7a,
+    };
+    float out[160] = {0};
+    TEST_ASSERT(qwen4_iq4nl_decode_row(row0, 160, out));
+    const float expected_first[4] = {-0.0100111961f, 0.0129091740f, -0.0181782246f, 0.0129091740f};
+    const float expected_last[4]  = {-0.0170595646f, -0.0032141209f, -0.0220043659f, 0.0024724007f};
+    for (int i = 0; i < 4; i++) {
+        TEST_ASSERT(fabsf(out[i] - expected_first[i]) < 1e-6f);
+        TEST_ASSERT(fabsf(out[156 + i] - expected_last[i]) < 1e-6f);
+    }
+    /* Reject malformed widths / non-finite scales. */
+    TEST_ASSERT(!qwen4_iq4nl_decode_row(row0, 159, out));
+    uint8_t bad[18] = {0};
+    bad[0] = 0x7c; bad[1] = 0x7f; /* +inf fp16 scale */
+    TEST_ASSERT(!qwen4_iq4nl_decode_row(bad, 32, out));
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -7343,6 +7370,7 @@ static const ds4_test_entry test_entries[] = {
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--iq4nl-ngram", "iq4nl-ngram", "IQ4_NL n-gram row decoder vs llama.cpp reference", test_iq4nl_ngram_decode},
 };
 
 static void test_print_help(const char *prog) {
