@@ -2610,6 +2610,21 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
                         y[16] * ds4_metal_mxfp4_values[q0 >> 4] +
                         y[17] * ds4_metal_mxfp4_values[q1 >> 4]);
         }
+    } else if (weight_type == 20) {
+        /* iq4_nl: 18-byte blocks, fp16 scale + 16 nibble bytes; same lane
+         * mapping as mxfp4/q4_0, values from the 16-entry k-value table. */
+        const short ix = tiisg / 8, it = tiisg % 8;
+        const uint nb = in_dim / 32;
+        for (uint ib = (uint)ix; ib < nb; ib += 4) {
+            device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 18);
+            device const float *y = x + ib * 32 + (uint)it * 2;
+            const float d = (float)(*(device const half *)b);
+            const uint q0 = b[2 + it * 2], q1 = b[3 + it * 2];
+            acc += d * (y[0] * ds4_metal_iq4nl_values[q0 & 0xfu] +
+                        y[1] * ds4_metal_iq4nl_values[q1 & 0xfu] +
+                        y[16] * ds4_metal_iq4nl_values[q0 >> 4] +
+                        y[17] * ds4_metal_iq4nl_values[q1 >> 4]);
+        }
     } else if (weight_type == 2) {
         const short ix = tiisg / 8, it = tiisg % 8;
         const uint nb = in_dim / 32;

@@ -1095,6 +1095,11 @@ typedef struct {
     uint8_t qs[QK_MXFP4 / 2];
 } block_mxfp4;
 
+typedef struct {
+    uint16_t d;
+    uint8_t qs[QK_MXFP4 / 2];
+} block_iq4_nl;
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
@@ -1103,6 +1108,7 @@ DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
+DS4_STATIC_ASSERT(ds4_block_iq4_nl_size, sizeof(block_iq4_nl) == 18);
 
 typedef struct {
     uint32_t ctx_size;
@@ -4267,6 +4273,29 @@ static float ds4_vec_dot_mxfp4_f32(int n, const block_mxfp4 *x, const float *y) 
     return sumf;
 }
 
+/* llama.cpp IQ4_NL k-values, shared with the n-gram row decoder. */
+static const float ds4_iq4nl_values[16] = {
+    -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
+       1.f,   13.f,  25.f,  38.f,  53.f,  69.f,  89.f, 113.f,
+};
+
+static float ds4_vec_dot_iq4_nl_f32(int n, const block_iq4_nl *x, const float *y) {
+    const int nb = n / QK_MXFP4;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ib++) {
+        const float d = f16_to_f32(x[ib].d);
+        const float *yb = y + (uint64_t)ib * QK_MXFP4;
+        for (int j = 0; j < QK_MXFP4 / 2; j++) {
+            const uint8_t q = x[ib].qs[j];
+            sumf += d * ds4_iq4nl_values[q & 0x0fu] * yb[j];
+            sumf += d * ds4_iq4nl_values[q >> 4] * yb[j + QK_MXFP4 / 2];
+        }
+    }
+
+    return sumf;
+}
+
 static float ds4_vec_dot_q5_K_f32(int n, const block_q5_K *x, const float *y) {
     const int nb = n / QK_K;
     float sumf = 0.0f;
@@ -5001,7 +5030,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
            type == DS4_TENSOR_Q6_K ||
-           type == DS4_TENSOR_MXFP4;
+           type == DS4_TENSOR_MXFP4 ||
+           type == DS4_TENSOR_IQ4_NL;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -5013,6 +5043,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
     case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
+    case DS4_TENSOR_IQ4_NL:  return sizeof(block_iq4_nl);
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -16655,6 +16686,9 @@ static float glm_routed_moe_dot_f32(uint32_t type, int n, const uint8_t *row, co
     }
     if (type == DS4_TENSOR_MXFP4) {
         return ds4_vec_dot_mxfp4_f32(n, (const block_mxfp4 *)row, x);
+    }
+    if (type == DS4_TENSOR_IQ4_NL) {
+        return ds4_vec_dot_iq4_nl_f32(n, (const block_iq4_nl *)row, x);
     }
     ds4_die("GLM F32 routed-MoE reference encountered unsupported expert tensor type");
     return 0.0f;
@@ -58663,6 +58697,7 @@ static bool qwen4_expert_type_has_mm(uint32_t type) {
 static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 ||
                  t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
+                 t->type == DS4_TENSOR_IQ4_NL ||
                  ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
                   (t->dim[0] % 256u) == 0));
 }
@@ -58727,7 +58762,7 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         if (!qwen4_graph_expert_ok(l->ffn_gate_exps) || !qwen4_graph_expert_ok(l->ffn_up_exps) ||
             !qwen4_graph_expert_ok(l->ffn_down_exps)) {
             fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported routed expert type in layer %u "
-                    "(q8_0, mxfp4, q4_K, q2_K, iq2_xxs, f16, f32)\n", il);
+                    "(q8_0, mxfp4, iq4_nl, q4_K, q2_K, iq2_xxs, f16, f32)\n", il);
             return false;
         }
     }
@@ -68176,6 +68211,19 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
             for (uint32_t j = 0; j < 16u; j++) {
                 out[b * 32u + j] = d * ds4_mxfp4_values[p[1 + j] & 0x0fu];
                 out[b * 32u + 16u + j] = d * ds4_mxfp4_values[p[1 + j] >> 4];
+            }
+        }
+        break;
+    }
+    case DS4_TENSOR_IQ4_NL: {
+        const uint64_t blocks = n / 32u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 18u;
+        for (uint64_t b = 0; b < blocks; b++, p += 18u) {
+            const uint16_t h = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+            const float d = f16_to_f32(h);
+            for (uint32_t j = 0; j < 16u; j++) {
+                out[b * 32u + j] = d * ds4_iq4nl_values[p[2 + j] & 0x0fu];
+                out[b * 32u + 16u + j] = d * ds4_iq4nl_values[p[2 + j] >> 4];
             }
         }
         break;
