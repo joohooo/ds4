@@ -7311,6 +7311,7 @@ static void test_dspark_verify_depth(void) {
 /* Verify the IQ4_NL n-gram row decoder against a real row from a
  * Qwen3.8-Flash-Next GGUF, with reference values from llama.cpp gguf-py. */
 bool qwen4_iq4nl_decode_row(const uint8_t *raw, uint32_t width, float *out);
+void ds4_iq3_s_dequant_block(const void *block, float *out);
 
 static void test_iq4nl_ngram_decode(void) {
     static const uint8_t row0[90] = {
@@ -7333,6 +7334,36 @@ static void test_iq4nl_ngram_decode(void) {
     uint8_t bad[18] = {0};
     bad[0] = 0x7c; bad[1] = 0x7f; /* +inf fp16 scale */
     TEST_ASSERT(!qwen4_iq4nl_decode_row(bad, 32, out));
+}
+
+/* Verify the IQ3_S super-block dequantizer against a real block from a
+ * Qwen3.8-Flash-Next UD-IQ4_XS gate tensor, with reference values from
+ * llama.cpp gguf-py. */
+static void test_iq3_s_decode(void) {
+    static const uint8_t block[110] = {
+        0x8f,0x07,0x09,0x0c,0x86,0xb1,0x95,0xd0,0x09,0x32,
+        0x11,0xd0,0x3c,0x93,0xc0,0xe4,0xea,0x8a,0x90,0x51,
+        0x12,0xcb,0x9c,0x34,0x4e,0x99,0x1d,0x75,0x96,0x89,
+        0xb5,0x43,0x7f,0x9b,0x00,0x23,0x6e,0x9f,0xcd,0x1b,
+        0x49,0xc6,0x86,0xe2,0x26,0xc4,0x8d,0x6e,0xd0,0x1c,
+        0x1b,0x42,0x7c,0x97,0xdd,0xf6,0xca,0x07,0x84,0xc1,
+        0xb6,0xab,0x73,0x37,0xcb,0x01,0x01,0x01,0x00,0xa6,
+        0x02,0x80,0xb0,0x62,0x75,0x99,0x4b,0x08,0x97,0x1b,
+        0x40,0xa1,0x84,0xe5,0x02,0xf3,0x3f,0x8f,0x15,0xd5,
+        0x50,0xa9,0x69,0x6a,0xac,0xc1,0x65,0x29,0x0d,0xd8,
+        0xb7,0x5a,0x9d,0x94,0xbc,0xab,0x7b,0x9b,0xfc,0x89,
+    };
+    float out[256] = {0};
+    ds4_iq3_s_dequant_block(block, out);
+    const float expected_first[4] = {-0.039791f, 0.018569f, -0.029180f, 0.013264f};
+    const float expected_last[4]  = {0.005882f, -0.001961f, 0.001961f, -0.001961f};
+    float sum = 0.f;
+    for (int i = 0; i < 256; i++) sum += out[i];
+    for (int i = 0; i < 4; i++) {
+        TEST_ASSERT(fabsf(out[i] - expected_first[i]) < 1e-6f);
+        TEST_ASSERT(fabsf(out[252 + i] - expected_last[i]) < 1e-6f);
+    }
+    TEST_ASSERT(fabsf(sum - 0.433890f) < 1e-4f);
 }
 
 static void test_server_unit_group(void) {
@@ -7371,6 +7402,7 @@ static const ds4_test_entry test_entries[] = {
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--iq4nl-ngram", "iq4nl-ngram", "IQ4_NL n-gram row decoder vs llama.cpp reference", test_iq4nl_ngram_decode},
+    {"--iq3-s-decode", "iq3-s-decode", "IQ3_S super-block dequantizer vs llama.cpp reference", test_iq3_s_decode},
 };
 
 static void test_print_help(const char *prog) {
