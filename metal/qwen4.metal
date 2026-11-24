@@ -2745,6 +2745,27 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
                 acc += dl * ds4_metal_iq4nl_values[nib] * y[i];
             }
         }
+    } else if (weight_type == 7) {
+        /* q5_1: 24-byte blocks (fp16 d and m, 32 fifth bits, 16 nibble
+         * bytes). Element j = qh bit j << 4 | low nibble of qs[j]; element
+         * 16+j = qh bit 12+j << 4 | high nibble. Lane mapping matches the
+         * q4_0 branch: 4 elements per lane. */
+        const short ix = tiisg / 8, it = tiisg % 8;
+        const uint nb = in_dim / 32;
+        for (uint ib = (uint)ix; ib < nb; ib += 4) {
+            device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 24);
+            device const float *y = x + ib * 32 + (uint)it * 2;
+            const float d = (float)(*(device const half *)b);
+            const float m = (float)(*(device const half *)(b + 2));
+            uint qh = (uint)b[4] | ((uint)b[5] << 8) | ((uint)b[6] << 16) | ((uint)b[7] << 24);
+            const uint q0 = b[8 + it * 2], q1 = b[9 + it * 2];
+            const float x0 = (float)((q0 & 0xfu) | ((qh >> (2u * it)) & 1u) << 4);
+            const float x1 = (float)((q1 & 0xfu) | ((qh >> (2u * it + 1u)) & 1u) << 4);
+            const float x2 = (float)((q0 >> 4) | ((qh >> (16u + 2u * it)) & 1u) << 4);
+            const float x3 = (float)((q1 >> 4) | ((qh >> (17u + 2u * it)) & 1u) << 4);
+            acc += (d * x0 + m) * y[0] + (d * x1 + m) * y[1] +
+                   (d * x2 + m) * y[16] + (d * x3 + m) * y[17];
+        }
     } else if (weight_type == 2) {
         const short ix = tiisg / 8, it = tiisg % 8;
         const uint nb = in_dim / 32;
@@ -3613,6 +3634,25 @@ static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint 
         for (uint i = 0; i < 8; i++) {
             const uint nib = hi ? (qs[i] >> 4) : (qs[i] & 0xFu);
             dst[i] = (D)(dl * ds4_metal_iq4nl_values[nib]);
+        }
+        return;
+    }
+    if (type == 7) {
+        /* q5_1: 24-byte blocks of 32; element j = qh bit j << 4 | low nibble
+         * of qs[j], element 16+j = qh bit 12+j << 4 | high nibble. */
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 24);
+        const float d = (float)(*(device const half *)blk);
+        const float m = (float)(*(device const half *)(blk + 2));
+        uint qh = (uint)blk[4] | ((uint)blk[5] << 8) | ((uint)blk[6] << 16) | ((uint)blk[7] << 24);
+        const uint h0 = qh;
+        const uint h1 = qh >> 16u;
+        device const uchar *qs = blk + 8 + (q & 1u) * 8;
+        const bool hi = q >= 2;
+        for (uint i = 0; i < 8; i++) {
+            const uint j = (q & 1u) * 8 + i;
+            const uint nib = hi ? (qs[i] >> 4) : (qs[i] & 0xFu);
+            const uint hb = hi ? (h1 >> j) : (h0 >> j);
+            dst[i] = (D)(d * (float)(nib | ((hb & 1u) << 4)) + m);
         }
         return;
     }

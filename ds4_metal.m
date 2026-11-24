@@ -45,6 +45,7 @@ enum {
     DS4_METAL_TENSOR_Q5_K    = 13,
     DS4_METAL_TENSOR_Q6_K    = 14,
     DS4_METAL_TENSOR_Q8_K    = 15,
+    DS4_METAL_TENSOR_Q5_1    = 7,
     DS4_METAL_TENSOR_IQ2_XXS = 16,
     DS4_METAL_TENSOR_IQ4_NL  = 20,
     DS4_METAL_TENSOR_IQ3_S   = 21,
@@ -459,6 +460,7 @@ static id<MTLComputePipelineState> g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline
 static id<MTLComputePipelineState> g_moe_mul_mv_slots6_q4_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq4_nl_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_id_q5_1_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1;
@@ -8224,6 +8226,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_id_mxfp4_f32", 2);
         g_moe_mul_mv_id_iq4_nl_pipeline =
             ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_id_iq4_nl_f32", 2);
+        g_moe_mul_mv_id_q5_1_pipeline =
+            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_id_q5_1_f32", 2);
         g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline =
             ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_id_mxfp4_pair_swiglu_f32", 2);
         g_moe_mul_mv_id_mxfp4_sum6_pipeline =
@@ -8287,6 +8291,7 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_slots6_mxfp4_sum6_f32", 2);
         if (!g_moe_mul_mv_id_mxfp4_pipeline ||
             !g_moe_mul_mv_id_iq4_nl_pipeline ||
+            !g_moe_mul_mv_id_q5_1_pipeline ||
             !g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline ||
             !g_moe_mul_mv_id_mxfp4_sum6_pipeline ||
             !g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipeline ||
@@ -11653,6 +11658,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_slots6_q4_k_sum6_pipeline = nil;
         g_moe_mul_mv_id_mxfp4_pipeline = nil;
         g_moe_mul_mv_id_iq4_nl_pipeline = nil;
+        g_moe_mul_mv_id_q5_1_pipeline = nil;
         g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_id_mxfp4_sum6_pipeline = nil;
         g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1 = nil;
@@ -31557,6 +31563,10 @@ static uint32_t ds4_gpu_routed_mv_nr0(uint32_t type) {
     case DS4_METAL_TENSOR_Q8_K:    return 2;
     case DS4_METAL_TENSOR_Q4_K:    return 2;
     case DS4_METAL_TENSOR_MXFP4:   return 2;
+    case DS4_METAL_TENSOR_IQ4_NL:  return 2;
+    case DS4_METAL_TENSOR_Q5_1:    return 2;
+    case DS4_METAL_TENSOR_IQ3_S:
+    case DS4_METAL_TENSOR_IQ4_XS:  return 4;
     case DS4_METAL_TENSOR_Q2_K:
     case DS4_METAL_TENSOR_IQ2_XXS: return 4;
     default:                       return 0;
@@ -31662,6 +31672,9 @@ static NSUInteger ds4_gpu_routed_mv_smem(uint32_t type) {
     if (type == DS4_METAL_TENSOR_IQ4_NL) {
         return 32u * sizeof(float);
     }
+    if (type == DS4_METAL_TENSOR_Q5_1) {
+        return 32u * sizeof(float);
+    }
     return 0;
 }
 
@@ -31684,6 +31697,7 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mv_pipeline(uint32_t type) {
     case DS4_METAL_TENSOR_Q4_K:    return g_moe_mul_mv_id_q4_k_pipeline;
     case DS4_METAL_TENSOR_MXFP4:   return g_moe_mul_mv_id_mxfp4_pipeline;
     case DS4_METAL_TENSOR_IQ4_NL:  return g_moe_mul_mv_id_iq4_nl_pipeline;
+    case DS4_METAL_TENSOR_Q5_1:    return g_moe_mul_mv_id_q5_1_pipeline;
     default:                       return nil;
     }
 }
@@ -48504,6 +48518,7 @@ static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
     case 16u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 66u;    /* iq2_xxs */
     case 39u: return (in_dim / 32u) * 17u;   /* mxfp4 */
     case 20u: return (in_dim / 32u) * 18u;   /* iq4_nl */
+    case 7u:  return (in_dim / 32u) * 24u;   /* q5_1 */
     case 21u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 110u;   /* iq3_s */
     case 23u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 136u;   /* iq4_xs */
     case 2u:  return (in_dim / 32u) * 18u;   /* q4_0 */
@@ -49913,7 +49928,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[8];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 ||
-        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u && weight_type != 20u && weight_type != 21u && weight_type != 23u) ||
+        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u && weight_type != 20u && weight_type != 21u && weight_type != 23u && weight_type != 7u) ||
         (in_dim % 64) != 0 || ff_dim == 0 || n_expert == 0 || n_expert > 512 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, expert_bytes * n_expert, "moe gate experts") ||
         !qwen4_bind_weight(&b[1], model_map, model_size, up_offset, expert_bytes * n_expert, "moe up experts") ||
@@ -49996,7 +50011,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[6];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 ||
-        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u && weight_type != 20u && weight_type != 21u && weight_type != 23u) ||
+        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u && weight_type != 20u && weight_type != 21u && weight_type != 23u && weight_type != 7u) ||
         (ff_dim % 64) != 0 || out_dim == 0 || n_expert == 0 || n_expert > 512 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert_bytes * n_expert, "moe down experts") ||
         !qwen4_bind_tensor(&b[1], lists, (uint64_t)n_expert * list_cap * sizeof(int32_t), "moe lists") ||

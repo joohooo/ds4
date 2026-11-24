@@ -7312,6 +7312,7 @@ static void test_dspark_verify_depth(void) {
  * Qwen3.8-Flash-Next GGUF, with reference values from llama.cpp gguf-py. */
 bool qwen4_iq4nl_decode_row(const uint8_t *raw, uint32_t width, float *out);
 void ds4_iq3_s_dequant_block(const void *block, float *out);
+void ds4_q5_1_dequant_block(const void *block, float *out);
 
 static void test_iq4nl_ngram_decode(void) {
     static const uint8_t row0[90] = {
@@ -7366,6 +7367,27 @@ static void test_iq3_s_decode(void) {
     TEST_ASSERT(fabsf(sum - 0.433890f) < 1e-4f);
 }
 
+/* Verify the Q5_1 block dequantizer against a real block from a
+ * Qwen3.8-Flash-Next UD-Q4_K_XL down tensor, with reference values from
+ * llama.cpp gguf-py. */
+static void test_q5_1_decode(void) {
+    static const uint8_t block[24] = {
+        0x54,0x17,0xe9,0xa6,0x1a,0x35,0x25,0xa8,0x6e,0xd0,0xf0,0x83,
+        0x30,0xd6,0xb9,0x0f,0x82,0xd6,0xdb,0x14,0xea,0x25,0xcb,0xa6,
+    };
+    float out[32] = {0};
+    ds4_q5_1_dequant_block(block, out);
+    const float expected_first[4] = {-0.001945f, 0.001633f, -0.026993f, 0.007f};
+    const float expected_last[4]  = {-0.001945f, 0.005211f, -0.005524f, 0.019524f};
+    float sum = 0.f;
+    for (int i = 0; i < 32; i++) sum += out[i];
+    for (int i = 0; i < 4; i++) {
+        TEST_ASSERT(fabsf(out[i] - expected_first[i]) < 1e-6f);
+        TEST_ASSERT(fabsf(out[28 + i] - expected_last[i]) < 1e-6f);
+    }
+    TEST_ASSERT(fabsf(sum - -0.055099f) < 1e-5f);
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -7403,6 +7425,7 @@ static const ds4_test_entry test_entries[] = {
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--iq4nl-ngram", "iq4nl-ngram", "IQ4_NL n-gram row decoder vs llama.cpp reference", test_iq4nl_ngram_decode},
     {"--iq3-s-decode", "iq3-s-decode", "IQ3_S super-block dequantizer vs llama.cpp reference", test_iq3_s_decode},
+    {"--q5-1-decode", "q5-1-decode", "Q5_1 block dequantizer vs llama.cpp reference", test_q5_1_decode},
 };
 
 static void test_print_help(const char *prog) {

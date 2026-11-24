@@ -427,6 +427,13 @@ struct block_iq4_nl {
     uchar qs[QK_MXFP4/2];
 };
 
+struct block_q5_1 {
+    half d;
+    half m;
+    uchar qh[4];
+    uchar qs[QK_MXFP4/2];
+};
+
 struct ds4_metal_glm_routed_moe_args {
     uint32_t in_dim;
     uint32_t mid_dim;
@@ -3055,6 +3062,80 @@ void kernel_mul_mv_iq4nl_f32_impl(
     }
 }
 
+/* Q5_1: 24-byte blocks (fp16 d and m, 32 fifth bits, 16 nibble bytes).
+ * Element j uses qh bit j, element j+16 uses qh bit j+12; value = d*x + m
+ * so each lane also accumulates the sum of its 16 y elements. */
+template<int nr0, typename args_t>
+void kernel_mul_mv_q5_1_f32_impl(
+        args_t args,
+        device const char *src0,
+        device const char *src1,
+        device       char *dst,
+        threadgroup  char *shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    const int nb = args.ne00 / QK_MXFP4;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    const uint i12 = tgpig.z % args.ne12;
+    const uint i13 = tgpig.z / args.ne12;
+    const uint64_t offset0 = (uint64_t)first_row * args.nb01 +
+        (uint64_t)(i12 / args.r2) * args.nb02 + (uint64_t)(i13 / args.r3) * args.nb03;
+    const uint64_t offset1 = (uint64_t)tgpig.y * args.nb11 +
+        (uint64_t)i12 * args.nb12 + (uint64_t)i13 * args.nb13;
+
+    device const block_q5_1 *x = (device const block_q5_1 *)(src0 + offset0);
+    device const float *y = (device const float *)(src1 + offset1);
+    const int row_blocks = (int)(args.nb01 / sizeof(block_q5_1));
+    const short ix = tiisg / 2;
+    const short it = tiisg & 1;
+
+    float sumf[nr0] = {0.f};
+    device const float *yb = y + ix * QK_MXFP4 + it * 8;
+    for (int ib = ix; ib < nb; ib += 16) {
+        device const float4 *y4 = (device const float4 *)yb;
+        const float4 yl0 = y4[0];
+        const float4 yl1 = y4[4];
+        const float4 yl2 = y4[1];
+        const float4 yl3 = y4[5];
+
+        FOR_UNROLL (short row = 0; row < nr0; row++) {
+            device const block_q5_1 &xb = x[row * row_blocks + ib];
+            device const uchar *q = xb.qs + 8 * it;
+            const float d = (float)xb.d;
+            const float m = (float)xb.m;
+            uint qh;
+            qh = (uint)xb.qh[0] | ((uint)xb.qh[1] << 8) |
+                 ((uint)xb.qh[2] << 16) | ((uint)xb.qh[3] << 24);
+            /* Element j (0..15) pairs qh bit j with the low nibble of qs[j];
+             * element 16+j pairs qh bit 12+j with the high nibble. Lane it
+             * covers j = 8*it..8*it+7 and the matching high half. */
+            const uint h0 = qh >> (8u * (uint)it);
+            const uint h1 = qh >> (16u + 8u * (uint)it);
+            float acc = 0.f;
+            float ysum = 0.f;
+            for (uint k = 0; k < 8; k++) {
+                const int x0 = (int)(((q[k] & 15u) | ((h0 >> k) & 1u) << 4));
+                const int x1 = (int)(((q[k] >> 4) | ((h1 >> k) & 1u) << 4));
+                acc += (float)x0 * yb[k] + (float)x1 * yb[16 + k];
+                ysum += yb[k] + yb[16 + k];
+            }
+            sumf[row] += d * acc + m * ysum;
+        }
+        yb += 16 * QK_MXFP4;
+    }
+
+    device float *dst_f32 = (device float *)dst +
+        (uint64_t)tgpig.z * args.ne0 * args.ne1 + (uint64_t)tgpig.y * args.ne0;
+    FOR_UNROLL (short row = 0; row < nr0; row++) {
+        if (first_row + row < args.ne0) {
+            const float sum = simd_sum(sumf[row]);
+            if (tiisg == 0) dst_f32[first_row + row] = sum;
+        }
+    }
+}
+
 template<int nr0, typename args_t>
 void kernel_mul_mv_q8_K_f32_impl(
         args_t args,
@@ -3455,6 +3536,7 @@ template [[host_name("kernel_mul_mv_id_q8_K_f32")]]    kernel kernel_mul_mv_id_q
 template [[host_name("kernel_mul_mv_id_iq2_xxs_f32")]] kernel kernel_mul_mv_id_q_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_xxs_f32_impl<N_R0_IQ2_XXS>>>;
 template [[host_name("kernel_mul_mv_id_mxfp4_f32")]]   kernel kernel_mul_mv_id_q_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_mxfp4_f32_impl<N_R0_MXFP4>>>;
 template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_q_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4nl_f32_impl<N_R0_IQ4_NL>>>;
+template [[host_name("kernel_mul_mv_id_q5_1_f32")]]    kernel kernel_mul_mv_id_q_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q5_1_f32_impl<N_R0_MXFP4>>>;
 
 // Plain dense Q4_K matvec on the classic impl. The mul_mv_ext family used
 // by the generic dense path tops out around 220 GB/s on M5 for the GLM

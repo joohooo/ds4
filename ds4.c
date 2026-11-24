@@ -1097,6 +1097,13 @@ typedef struct {
 
 typedef struct {
     uint16_t d;
+    uint16_t m;
+    uint8_t qh[4];
+    uint8_t qs[QK_MXFP4 / 2];
+} block_q5_1;
+
+typedef struct {
+    uint16_t d;
     uint8_t qs[QK_MXFP4 / 2];
 } block_iq4_nl;
 
@@ -1109,6 +1116,7 @@ DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
 DS4_STATIC_ASSERT(ds4_block_iq4_nl_size, sizeof(block_iq4_nl) == 18);
+DS4_STATIC_ASSERT(ds4_block_q5_1_size, sizeof(block_q5_1) == 24);
 
 typedef struct {
     uint16_t d;
@@ -2389,6 +2397,7 @@ enum {
     DS4_TENSOR_Q5_K     = 13,
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
+    DS4_TENSOR_Q5_1     = 7,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_IQ4_NL   = 20,
     DS4_TENSOR_IQ3_S    = 21,
@@ -4465,6 +4474,43 @@ static float ds4_vec_dot_iq4_xs_f32(int n, const block_iq4_xs *x, const float *y
     return sumf;
 }
 
+/* Dequantize one 24-byte Q5_1 block (32 values). Unit-test facing. */
+void ds4_q5_1_dequant_block(const block_q5_1 *blk, float *out) {
+    const float d = f16_to_f32(blk->d);
+    const float m = f16_to_f32(blk->m);
+    uint32_t qh;
+    memcpy(&qh, blk->qh, sizeof(qh));
+    for (int j = 0; j < QK_MXFP4 / 2; j++) {
+        const uint8_t xh0 = ((qh >> j) << 4) & 0x10;
+        const uint8_t xh1 = (qh >> (j + 12)) & 0x10;
+        out[j] = d * ((blk->qs[j] & 0x0F) | xh0) + m;
+        out[j + QK_MXFP4 / 2] = d * ((blk->qs[j] >> 4) | xh1) + m;
+    }
+}
+
+static float ds4_vec_dot_q5_1_f32(int n, const block_q5_1 *x, const float *y) {
+    const int nb = n / QK_MXFP4;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ib++) {
+        const float d = f16_to_f32(x[ib].d);
+        const float m = f16_to_f32(x[ib].m);
+        uint32_t qh;
+        memcpy(&qh, x[ib].qh, sizeof(qh));
+        const float *yb = y + (uint64_t)ib * QK_MXFP4;
+        for (int j = 0; j < QK_MXFP4 / 2; j++) {
+            const uint8_t xh0 = ((qh >> j) << 4) & 0x10;
+            const uint8_t xh1 = (qh >> (j + 12)) & 0x10;
+            const int x0 = (x[ib].qs[j] & 0x0F) | xh0;
+            const int x1 = (x[ib].qs[j] >> 4) | xh1;
+            sumf += (d * x0 + m) * yb[j];
+            sumf += (d * x1 + m) * yb[j + QK_MXFP4 / 2];
+        }
+    }
+
+    return sumf;
+}
+
 static float ds4_vec_dot_q5_K_f32(int n, const block_q5_K *x, const float *y) {
     const int nb = n / QK_K;
     float sumf = 0.0f;
@@ -5202,7 +5248,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_MXFP4 ||
            type == DS4_TENSOR_IQ4_NL ||
            type == DS4_TENSOR_IQ3_S ||
-           type == DS4_TENSOR_IQ4_XS;
+           type == DS4_TENSOR_IQ4_XS ||
+           type == DS4_TENSOR_Q5_1;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -5217,6 +5264,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_IQ4_NL:  return sizeof(block_iq4_nl);
     case DS4_TENSOR_IQ3_S:   return sizeof(block_iq3_s);
     case DS4_TENSOR_IQ4_XS:  return sizeof(block_iq4_xs);
+    case DS4_TENSOR_Q5_1:    return sizeof(block_q5_1);
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -16868,6 +16916,9 @@ static float glm_routed_moe_dot_f32(uint32_t type, int n, const uint8_t *row, co
     }
     if (type == DS4_TENSOR_IQ4_XS) {
         return ds4_vec_dot_iq4_xs_f32(n, (const block_iq4_xs *)row, x);
+    }
+    if (type == DS4_TENSOR_Q5_1) {
+        return ds4_vec_dot_q5_1_f32(n, (const block_q5_1 *)row, x);
     }
     ds4_die("GLM F32 routed-MoE reference encountered unsupported expert tensor type");
     return 0.0f;
@@ -58872,13 +58923,14 @@ static bool qwen4_expert_type_has_mm(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_MXFP4 || type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_IQ4_NL || type == DS4_TENSOR_IQ3_S ||
-           type == DS4_TENSOR_IQ4_XS;
+           type == DS4_TENSOR_IQ4_XS || type == DS4_TENSOR_Q5_1;
 }
 
 static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 ||
                  t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
                  (t->type == DS4_TENSOR_IQ4_NL && (t->dim[0] % 32u) == 0) ||
+                 (t->type == DS4_TENSOR_Q5_1 && (t->dim[0] % 32u) == 0) ||
                  ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K ||
                    t->type == DS4_TENSOR_IQ2_XXS || t->type == DS4_TENSOR_IQ3_S ||
                    t->type == DS4_TENSOR_IQ4_XS) &&
@@ -58945,7 +58997,7 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         if (!qwen4_graph_expert_ok(l->ffn_gate_exps) || !qwen4_graph_expert_ok(l->ffn_up_exps) ||
             !qwen4_graph_expert_ok(l->ffn_down_exps)) {
             fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported routed expert type in layer %u "
-                    "(q8_0, mxfp4, iq4_nl, q4_K, q2_K, iq2_xxs, f16, f32)\n", il);
+                    "(q8_0, mxfp4, iq4_nl, iq4_xs, iq3_s, q5_1, q4_K, q2_K, iq2_xxs, f16, f32)\n", il);
             return false;
         }
     }
@@ -68423,6 +68475,24 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
         const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 136u;
         for (uint64_t b = 0; b < blocks; b++, p += 136u)
             ds4_iq4_xs_dequant_block((const block_iq4_xs *)p, out + b * QK_K);
+        break;
+    }
+    case DS4_TENSOR_Q5_1: {
+        const uint64_t blocks = n / 32u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 24u;
+        for (uint64_t b = 0; b < blocks; b++, p += 24u) {
+            const block_q5_1 *blk = (const block_q5_1 *)p;
+            const float d = f16_to_f32(blk->d);
+            const float m = f16_to_f32(blk->m);
+            uint32_t qh;
+            memcpy(&qh, blk->qh, sizeof(qh));
+            for (uint32_t j = 0; j < 16u; j++) {
+                const uint8_t xh0 = ((qh >> j) << 4) & 0x10;
+                const uint8_t xh1 = (qh >> (j + 12)) & 0x10;
+                out[b * 32u + j] = d * ((blk->qs[j] & 0x0F) | xh0) + m;
+                out[b * 32u + 16u + j] = d * ((blk->qs[j] >> 4) | xh1) + m;
+            }
+        }
         break;
     }
     case DS4_TENSOR_Q2_K: {
