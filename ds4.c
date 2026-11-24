@@ -2443,6 +2443,7 @@ typedef struct ds4_model {
 
     int ngram_fd;
     const ds4_tensor *ngram_tensor;
+    bool ngram_tensor_owned;   /* true when ngram_tensor was heap-allocated by --ple */
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -2666,7 +2667,8 @@ static bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *
 
 static void model_close(ds4_model *m) {
     if (!m) return;
-    if (m->ngram_tensor && m->ngram_fd >= 0) close(m->ngram_fd);
+    if (m->ngram_fd >= 0) close(m->ngram_fd);
+    if (m->ngram_tensor_owned && m->ngram_tensor) free((void *)m->ngram_tensor);
     free(m->kv);
     free(m->tensors);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
@@ -2885,6 +2887,118 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     m->size = table->abs_offset;
     m->ngram_fd = fd;
     m->ngram_tensor = table;
+}
+
+static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name);
+
+/* Attach an external PLE sidecar GGUF (Qwen3.8).  The sidecar holds only the
+ * n-gram table tensor (ple.weight) plus a small header; it stays on disk with
+ * an uncached fd and never enters Metal residency, exactly like the inline
+ * table's disk-only path.  Replaces the inline ngram_fd/tensor after model_open. */
+static void model_attach_ple(ds4_model *m, const char *ple_path) {
+    if (!m || !ple_path || !ple_path[0]) return;
+    int fd = open(ple_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) ds4_die_errno("cannot open PLE sidecar", ple_path);
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 32) {
+        close(fd);
+        ds4_die("PLE sidecar is too small / cannot stat");
+    }
+#ifdef __APPLE__
+    if (fcntl(fd, F_NOCACHE, 1) || fcntl(fd, F_RDAHEAD, 0)) {
+        close(fd);
+        ds4_die_errno("cannot configure PLE sidecar disk reads", ple_path);
+    }
+#endif
+    /* Minimal GGUF header walk: magic/ver/tc/kc, KV, then tensor infos. */
+    uint8_t head[64];
+    if (pread(fd, head, sizeof(head), 0) != (ssize_t)sizeof(head)) {
+        close(fd); ds4_die("cannot read PLE sidecar header");
+    }
+    ds4_cursor c = {0};
+    c.base = head; c.size = sizeof(head);
+    uint32_t magic = 0, version = 0;
+    uint64_t n_tensors = 0, n_kv = 0;
+    if (!cursor_u32(&c, &magic) || magic != DS4_GGUF_MAGIC ||
+        !cursor_u32(&c, &version) || version != 3 ||
+        !cursor_u64(&c, &n_tensors) || !cursor_u64(&c, &n_kv)) {
+        close(fd); ds4_die("PLE sidecar is not GGUF v3");
+    }
+    /* We need the full header (KV can be large); map it read-only to parse. */
+    void *hmap = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (hmap == MAP_FAILED) { close(fd); ds4_die_errno("cannot map PLE sidecar", ple_path); }
+    c.base = hmap; c.size = (uint64_t)st.st_size; c.pos = 24;
+    for (uint64_t i = 0; i < n_kv; i++) {
+        ds4_str key; uint32_t type;
+        if (!cursor_string(&c, &key) || !cursor_u32(&c, &type) || !skip_value(&c, type, 0)) {
+            munmap(hmap, (size_t)st.st_size); close(fd);
+            ds4_die("cannot parse PLE sidecar metadata");
+        }
+    }
+    uint32_t align = 32;
+    /* find ple.weight tensor info */
+    ds4_tensor found = {0};
+    bool have = false;
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        ds4_str name; uint32_t nd = 0;
+        if (!cursor_string(&c, &name) || !cursor_u32(&c, &nd) || nd > DS4_MAX_DIMS) {
+            munmap(hmap, (size_t)st.st_size); close(fd);
+            ds4_die("cannot parse PLE sidecar tensor info");
+        }
+        ds4_tensor t = {0};
+        t.name = name; t.ndim = nd;
+        for (uint32_t d = 0; d < nd; d++)
+            if (!cursor_u64(&c, &t.dim[d])) { munmap(hmap, (size_t)st.st_size); close(fd); ds4_die("bad PLE tensor dim"); }
+        if (!cursor_u32(&c, &t.type) || !cursor_u64(&c, &t.rel_offset)) {
+            munmap(hmap, (size_t)st.st_size); close(fd);
+            ds4_die("bad PLE tensor info");
+        }
+        bool is_ple = (name.len == 10 && !memcmp(name.ptr, "ple.weight", 10)) ||
+                      (name.len == 27 && !memcmp(name.ptr, "per_layer_token_embd.weight", 27));
+        if (is_ple) {
+            found = t; have = true;
+        }
+    }
+    uint64_t data_start = align_up(c.pos, align);
+    munmap(hmap, (size_t)st.st_size);
+    fprintf(stderr, "ds4: PLE sidecar parse: have=%d ndim=%u dim0=%llu dim1=%llu type=%u\n",
+            (int)have, found.ndim, (unsigned long long)found.dim[0],
+            (unsigned long long)found.dim[1], found.type);
+    /* ds4 shape is not selected yet at attach time, so validate against the
+     * tensor's own geometry (width 160 for Qwen3.8) rather than the global. */
+    if (!have || found.ndim != 2 || found.dim[0] != 160 ||
+        (found.type != DS4_TENSOR_BF16 && found.type != DS4_TENSOR_IQ4_NL)) {
+        close(fd);
+        ds4_die("PLE sidecar lacks a valid per_layer_token_embd/ple.weight tensor");
+    }
+    found.elements = found.dim[0] * found.dim[1];
+    if (!tensor_nbytes(found.type, found.elements, &found.bytes) ||
+        data_start + found.rel_offset + found.bytes > (uint64_t)st.st_size) {
+        close(fd); ds4_die("PLE sidecar tensor exceeds file");
+    }
+    found.abs_offset = data_start + found.rel_offset;
+
+    /* Redirect the inline PLE tensor descriptor in m->tensors to the sidecar.
+     * config_validate_model() later picks this same entry via model_find_tensor,
+     * and qwen4_ngram_row() reads through ngram_fd + abs_offset.  No heap copy
+     * and no change to the engine's tensor ownership. */
+    ds4_tensor *inline_t = model_find_tensor(m, "per_layer_token_embd.weight");
+    if (!inline_t) {
+        close(fd);
+        ds4_die("model has no inline per_layer_token_embd to override with --ple");
+    }
+    if (m->ngram_fd >= 0) close(m->ngram_fd);
+    inline_t->type = found.type;
+    inline_t->dim[0] = found.dim[0];
+    inline_t->dim[1] = found.dim[1];
+    inline_t->elements = found.elements;
+    inline_t->bytes = found.bytes;
+    inline_t->abs_offset = found.abs_offset;
+    inline_t->rel_offset = found.rel_offset;
+    m->ngram_fd = fd;
+    m->ngram_tensor = inline_t;
+    fprintf(stderr, "ds4: attached external PLE sidecar %s (type=%u rows=%llu)\n",
+            ple_path, found.type, (unsigned long long)found.dim[1]);
 }
 
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
@@ -72210,6 +72324,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    if (opt->ple_path && opt->ple_path[0]) {
+        model_attach_ple(&e->model, opt->ple_path);
+        if (!e->model.ngram_tensor)
+            ds4_die("Qwen model needs its inline n-gram table or --ple sidecar");
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
         opt->vision_path && opt->vision_path[0] && e->backend != DS4_BACKEND_METAL) {
         fprintf(stderr, "ds4: V4.1 vision requires Metal\n");
