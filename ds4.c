@@ -2928,14 +2928,25 @@ static void model_attach_ple(ds4_model *m, const char *ple_path) {
     void *hmap = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (hmap == MAP_FAILED) { close(fd); ds4_die_errno("cannot map PLE sidecar", ple_path); }
     c.base = hmap; c.size = (uint64_t)st.st_size; c.pos = 24;
+    uint32_t align = 32;
     for (uint64_t i = 0; i < n_kv; i++) {
-        ds4_str key; uint32_t type;
-        if (!cursor_string(&c, &key) || !cursor_u32(&c, &type) || !skip_value(&c, type, 0)) {
+        ds4_str key; uint32_t type = 0;
+        if (!cursor_string(&c, &key) || !cursor_u32(&c, &type)) {
             munmap(hmap, (size_t)st.st_size); close(fd);
             ds4_die("cannot parse PLE sidecar metadata");
         }
+        uint64_t val_pos = c.pos;   /* value starts after key + type */
+        if (ds4_streq(key, "general.alignment") && type == GGUF_VALUE_UINT32 &&
+            val_pos + 4 <= (uint64_t)st.st_size) {
+            uint32_t a;
+            memcpy(&a, (const uint8_t *)hmap + val_pos, sizeof(a));
+            if (a != 0) align = a;
+        }
+        if (!skip_value(&c, type, 0)) {
+            munmap(hmap, (size_t)st.st_size); close(fd);
+            ds4_die("cannot parse PLE sidecar metadata value");
+        }
     }
-    uint32_t align = 32;
     /* find ple.weight tensor info */
     ds4_tensor found = {0};
     bool have = false;
@@ -3002,8 +3013,9 @@ static void model_attach_ple(ds4_model *m, const char *ple_path) {
     ple_t->rel_offset = found.rel_offset;
     m->ngram_fd = fd;
     m->ngram_tensor = ple_t;
-    fprintf(stderr, "ds4: attached external PLE sidecar %s (type=%u rows=%llu)\n",
-            ple_path, found.type, (unsigned long long)found.dim[1]);
+    fprintf(stderr, "ds4: attached external PLE sidecar %s (type=%u rows=%llu align=%u data_start=%llu abs_off=%llu)\n",
+            ple_path, found.type, (unsigned long long)found.dim[1],
+            align, (unsigned long long)data_start, (unsigned long long)found.abs_offset);
 }
 
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
