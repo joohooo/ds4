@@ -2978,25 +2978,30 @@ static void model_attach_ple(ds4_model *m, const char *ple_path) {
     }
     found.abs_offset = data_start + found.rel_offset;
 
-    /* Redirect the inline PLE tensor descriptor in m->tensors to the sidecar.
-     * config_validate_model() later picks this same entry via model_find_tensor,
-     * and qwen4_ngram_row() reads through ngram_fd + abs_offset.  No heap copy
-     * and no change to the engine's tensor ownership. */
-    ds4_tensor *inline_t = model_find_tensor(m, "per_layer_token_embd.weight");
-    if (!inline_t) {
-        close(fd);
-        ds4_die("model has no inline per_layer_token_embd to override with --ple");
+    /* Redirect an inline PLE descriptor if present; otherwise append a new
+     * tensor entry so config_validate_model() finds it via model_find_tensor. */
+    ds4_tensor *ple_t = model_find_tensor(m, "per_layer_token_embd.weight");
+    if (!ple_t) {
+        ds4_tensor *grown = realloc(m->tensors, (m->n_tensors + 1) * sizeof(*m->tensors));
+        if (!grown) { close(fd); ds4_die("out of memory for external PLE tensor"); }
+        m->tensors = grown;
+        ple_t = &m->tensors[m->n_tensors++];
+        memset(ple_t, 0, sizeof(*ple_t));
+        static const char ple_name[] = "per_layer_token_embd.weight";
+        ple_t->name.ptr = ple_name;
+        ple_t->name.len = sizeof(ple_name) - 1;
+        ple_t->ndim = 2;
     }
     if (m->ngram_fd >= 0) close(m->ngram_fd);
-    inline_t->type = found.type;
-    inline_t->dim[0] = found.dim[0];
-    inline_t->dim[1] = found.dim[1];
-    inline_t->elements = found.elements;
-    inline_t->bytes = found.bytes;
-    inline_t->abs_offset = found.abs_offset;
-    inline_t->rel_offset = found.rel_offset;
+    ple_t->type = found.type;
+    ple_t->dim[0] = found.dim[0];
+    ple_t->dim[1] = found.dim[1];
+    ple_t->elements = found.elements;
+    ple_t->bytes = found.bytes;
+    ple_t->abs_offset = found.abs_offset;
+    ple_t->rel_offset = found.rel_offset;
     m->ngram_fd = fd;
-    m->ngram_tensor = inline_t;
+    m->ngram_tensor = ple_t;
     fprintf(stderr, "ds4: attached external PLE sidecar %s (type=%u rows=%llu)\n",
             ple_path, found.type, (unsigned long long)found.dim[1]);
 }
